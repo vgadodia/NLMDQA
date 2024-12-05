@@ -386,23 +386,31 @@ class DataMerger:
         return merged
 
 class CacheManager:
-    """Manages query caching using Redis"""
-    def __init__(self, redis_client: redis.Redis):
-        self.redis_client = redis_client
+    """Manages query caching using an in-memory dictionary"""
+    def __init__(self):
+        self.cache = {}
         self.cache_ttl = 3600  # 1 hour
+        self.timestamps = {}  # Store timestamps for TTL checking
+        from time import time
+        self.time = time
     
     def get_cached_result(self, query: str) -> Union[List[Dict], None]:
         """Get cached query result"""
-        cached = self.redis_client.get(self._get_cache_key(query))
-        return json.loads(cached) if cached else None
+        cache_key = self._get_cache_key(query)
+        if cache_key in self.cache:
+            # Check if cache has expired
+            if self.time() - self.timestamps[cache_key] > self.cache_ttl:
+                del self.cache[cache_key]
+                del self.timestamps[cache_key]
+                return None
+            return self.cache[cache_key]
+        return None
     
     def cache_result(self, query: str, result: List[Dict]):
         """Cache query result"""
-        self.redis_client.setex(
-            self._get_cache_key(query),
-            self.cache_ttl,
-            json.dumps(result)
-        )
+        cache_key = self._get_cache_key(query)
+        self.cache[cache_key] = result
+        self.timestamps[cache_key] = self.time()
     
     def _get_cache_key(self, query: str) -> str:
         """Generate cache key for query"""
@@ -416,7 +424,7 @@ class NLMDQA:
         self.connector = DatabaseConnector(self.config)
         self.executor = QueryExecutor(self.connector)
         self.merger = DataMerger()
-        self.cache_manager = CacheManager(self.connector.redis_client)
+        self.cache_manager = CacheManager()
     
     def format_value_for_query(self, value, database_type):
         """Format values appropriately for different database types"""
@@ -449,10 +457,10 @@ class NLMDQA:
     async def process_query(self, natural_language_query: str) -> Dict:
         """Process natural language query and return results"""
         # Check cache first
-        # cached_result = self.cache_manager.get_cached_result(natural_language_query)
-        # if cached_result:
-        #     logger.info("Returning cached result")
-        #     return cached_result
+        cached_result = self.cache_manager.get_cached_result(natural_language_query)
+        if cached_result:
+            logger.info("Returning cached result")
+            return cached_result
 
         # Get queries directly from GPT-4
         pipeline_result = await self.parser.parse_query(natural_language_query)
@@ -504,7 +512,7 @@ class NLMDQA:
             test_final_results = results
         
         # Cache results
-        # self.cache_manager.cache_result(natural_language_query, merged_results)
+        self.cache_manager.cache_result(natural_language_query, test_final_results)
         
         return test_final_results
 
@@ -514,7 +522,7 @@ async def main():
     nlmdqa = NLMDQA()
     
     # Example query
-    query = "List movies where the director has also acted in another director's film"
+    query = "Show me all movies with an IMDB rating above 8.5"
     
     try:
         results = await nlmdqa.process_query(query)
