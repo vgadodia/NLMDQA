@@ -72,10 +72,19 @@ class QueryParser:
     def __init__(self, config: DatabaseConfig):
         self.client = AsyncOpenAI(api_key=config.openai_api_key)
         
-    async def parse_query(self, natural_language_query: str) -> Dict:
+    async def parse_query(self, natural_language_query: str, error_feedback: str = "") -> Dict:
+        """Generate database-specific queries directly from natural language"""
         try:
-            """Generate database-specific queries directly from natural language"""
+            error_context = f"""
+            PREVIOUS ERROR FEEDBACK:
+            {error_feedback}
+            
+            Please fix any issues mentioned above in the generated query.
+            """ if error_feedback else ""
+
             prompt = f"""
+            {error_context}
+
             Convert the following natural language query into a pipeline of database queries.
             You can create multi-stage queries where results from one query feed into another.
             
@@ -477,69 +486,92 @@ class NLMDQA:
                 return str(value)
             return f"'{value}'"
     
-    async def process_query(self, natural_language_query: str, human_readable: bool = False) -> Union[Dict, str]:
+    async def process_query(self, natural_language_query: str, human_readable: bool = False, retry_count: int = 0, error_feedback: str = "") -> Union[Dict, str]:
         """Process natural language query and return results"""
-        # Check cache first
-        cached_result = self.cache_manager.get_cached_result(natural_language_query)
-        if cached_result:
-            logger.info("Returning cached result")
-            return cached_result
+        MAX_RETRIES = 3
 
-        # Get queries directly from GPT-4
-        pipeline_result = await self.parser.parse_query(natural_language_query)
-        print("Generated pipeline: \n\n", json.dumps(pipeline_result, indent=2))
+        try:
+            # Check cache first
+            cached_result = self.cache_manager.get_cached_result(natural_language_query)
+            if cached_result:
+                logger.info("Returning cached result")
+                return cached_result
 
-        # Execute pipeline stages
-        stage_results = {}
-        final_results = {}
-        test_final_results = None
-        
-        for stage in pipeline_result['pipeline']:
-            stage_num = stage['stage']
-            database = stage['database']
-            query = stage['query'][database]
+            # Get queries directly from GPT-4
+            pipeline_result = await self.parser.parse_query(natural_language_query, error_feedback)
+            print("Generated pipeline: \n\n", json.dumps(pipeline_result, indent=2))
 
-            print(f"Stage {stage_num} original query: {query}")
+            # Execute pipeline stages
+            stage_results = {}
+            final_results = {}
+            test_final_results = None
             
-            # Replace placeholders with previous stage results
-            if isinstance(query, str):
-                for prev_stage, prev_results in stage_results.items():
-                    for key, value in prev_results.items():
-                        formatted_value = self.format_value_for_query(value, database)
-                        placeholder = f"{{previous_stage{prev_stage}.{key}}}"
-                        query = query.replace(placeholder, formatted_value)
-            elif isinstance(query, dict):  # MongoDB query
-                query_str = json.dumps(query)
-                for prev_stage, prev_results in stage_results.items():
-                    for key, value in prev_results.items():
-                        formatted_value = self.format_value_for_query(value, database)
-                        placeholder = f"{{previous_stage{prev_stage}.{key}}}"
-                        query = query.replace(placeholder, formatted_value)
-                query = json.loads(query_str)
+            for stage in pipeline_result['pipeline']:
+                stage_num = stage['stage']
+                database = stage['database']
+                query = stage['query'][database]
 
-            print(f"Stage {stage_num} formatted query: {query}")
-            
-            # Execute query based on database type
-            if database == 'postgresql':
-                results = self.executor.execute_postgres_query(query)
-            elif database == 'mongodb':
-                results = self.executor.execute_mongo_query(query)
-            elif database == 'neo4j':
-                results = self.executor.execute_neo4j_query(query)
-            
-            # Store results for this stage
-            stage_results[stage_num] = {
-                key: [r[key] for r in results] for key in stage['output_keys']
-            }
-            final_results[f"stage_{stage_num}"] = results
-            test_final_results = results
-        
-        # Cache results
-        self.cache_manager.cache_result(natural_language_query, test_final_results)
+                print(f"Stage {stage_num} original query: {query}")
+                
+                # Replace placeholders with previous stage results
+                if isinstance(query, str):
+                    for prev_stage, prev_results in stage_results.items():
+                        for key, value in prev_results.items():
+                            formatted_value = self.format_value_for_query(value, database)
+                            placeholder = f"{{previous_stage{prev_stage}.{key}}}"
+                            query = query.replace(placeholder, formatted_value)
+                elif isinstance(query, dict):  # MongoDB query
+                    query_str = json.dumps(query)
+                    for prev_stage, prev_results in stage_results.items():
+                        for key, value in prev_results.items():
+                            formatted_value = self.format_value_for_query(value, database)
+                            placeholder = f"{{previous_stage{prev_stage}.{key}}}"
+                            query = query.replace(placeholder, formatted_value)
+                    query = json.loads(query_str)
 
-        if human_readable:
-            return await self.generate_human_response(natural_language_query, test_final_results)
-        return test_final_results
+                print(f"Stage {stage_num} formatted query: {query}")
+                
+                # Execute query based on database type
+                if database == 'postgresql':
+                    results = self.executor.execute_postgres_query(query)
+                elif database == 'mongodb':
+                    results = self.executor.execute_mongo_query(query)
+                elif database == 'neo4j':
+                    results = self.executor.execute_neo4j_query(query)
+                
+                # Store results for this stage
+                stage_results[stage_num] = {
+                    key: [r[key] for r in results] for key in stage['output_keys']
+                }
+                final_results[f"stage_{stage_num}"] = results
+                test_final_results = results
+            
+            # Cache results
+            self.cache_manager.cache_result(natural_language_query, test_final_results)
+
+            if human_readable:
+                return await self.generate_human_response(natural_language_query, test_final_results)
+            return test_final_results
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"Error processing query (attempt {retry_count + 1}): {error_message}")
+            
+            if retry_count < MAX_RETRIES:
+                # Modify the parser's prompt to include the error feedback
+                error_feedback = f"""
+                Previous attempt failed with error: {error_message}
+                Please fix the query and try again. Common issues to check:
+                - Ensure JSON formatting is correct
+                - Verify database names are correct ('postgresql', 'neo4j', 'mongodb')
+                - Check that all referenced columns exist
+                - Verify syntax for the specific database being queried
+                """
+                
+                # Retry with incremented counter
+                logger.info(f"Retrying query (attempt {retry_count + 2})")
+                return await self.process_query(natural_language_query, human_readable, retry_count + 1, error_feedback)
+            else:
+                raise RuntimeError(f"Failed to process query after {MAX_RETRIES} attempts. Last error: {error_message}")
 
 # Example usage
 async def main():
@@ -555,7 +587,7 @@ async def main():
     nlmdqa = NLMDQA()
     
     # Example query
-    query = "Show me directors who have worked with the same actor in more than 3 movies"
+    query = "Find all war movies directed by Steven Spielberg that grossed over $200 million"
     
     try:
         start_time = time()
