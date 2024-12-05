@@ -80,16 +80,48 @@ class QueryParser:
             
             Natural Language Query: {natural_language_query}
             
-            IMPORTANT RULES FOR QUERY GENERATION:
-            1. Use proper SQL JOINs and CTEs (Common Table Expressions) whenever possible instead of separate queries
-            2. For aggregations and statistics, prefer using SQL GROUP BY, HAVING, and window functions
-            3. Minimize the number of pipeline stages by combining operations where possible
-            4. When querying across tables, maintain proper relationships through JOINs
-            5. Use subqueries or CTEs instead of trying to process result sets outside of SQL
-            6. Never try to directly substitute array results into a FROM clause
+            GENERAL RULES FOR QUERY GENERATION:
+            1. Only use multiple stages when you need to:
+            - Query across different databases
+            - Use results from one database to filter in another
+            - Join data that exists in different databases
+            2. Never use a stage just for ordering or aggregating previous results
+            3. Each stage should either:
+            - Fetch new data based on previous stage results
+            - Join data from a different database
+            - Transform data in a way that can't be done in a single query
+            4. When passing IDs between stages, always include them in output_keys
+
+            POSTGRESQL RULES:
+            1. Use proper SQL JOINs and CTEs (Common Table Expressions) whenever possible
+            2. For aggregations and statistics, use SQL GROUP BY, HAVING, and window functions
+            3. Include all necessary columns in output_keys, especially IDs needed for joins
+            4. Always qualify column names with table aliases (e.g., m.id, g.name)
+            5. Use meaningful table aliases (e.g., m for movies, g for genres)
+            6. Include ORDER BY in the same query when doing aggregations
             
-            Database Schema (use EXACT column names):
+            NEO4J RULES:
+            1. Always use different variable names for relationships and nodes
+            2. Never reuse the same variable name in a pattern
+            3. Include ORDER BY in the same MATCH clause, never in a separate stage
+            4. Never use WITH clauses with previous stage placeholders - instead use MATCH WHERE conditions
+            5. For multiple values from previous stages, use:
+            Good: WHERE x.id IN [{{previous_stage1.ids}}]
+            Bad: WITH [{{previous_stage1.ids}}] as ids ... // Never do this!
             
+            NEO4J QUERY PATTERNS:
+            1. For counting/aggregation:
+            MATCH (node1:Label1)-[r1:REL]->(node2:Label2)
+            WHERE node1.property = value
+            RETURN node2.property as prop, COUNT(*) as count
+            ORDER BY count DESC
+
+            2. For finding related entities:
+            MATCH (node1:Label1)-[r1:REL]->(node2:Label2)-[r2:REL]->(node3:Label3)
+            WHERE node1.id IN [{{previous_stage1.ids}}]
+            RETURN DISTINCT node3.id as id
+            
+            DATABASE SCHEMA:
             PostgreSQL Tables:
             movies (
                 id INTEGER PRIMARY KEY,  # Use 'id', never 'movie_id'
@@ -124,21 +156,9 @@ class QueryParser:
             - (Person)-[DIRECTED]->(Movie)
             - (Person)-[ACTED_IN]->(Movie)
 
-            VALIDATION RULES:
-            1. Always use 'id' (not 'movie_id') when referring to movies.id
-            2. Always use 'id' (not 'genre_id') when referring to genres.id
-            3. In movie_genres table, use 'movie_id' and 'genre_id' as they are junction table columns
-            4. Double-check all column names against the schema before using them
+            EXAMPLE QUERIES:
 
-            IMPORTANT RULES FOR NEO4J QUERIES:
-            1. Always use different variable names for relationships and nodes
-            2. Never reuse the same variable name in a pattern
-            3. Example pattern: (director:Person)-[r:DIRECTED]->(m:Movie)<-[acted:ACTED_IN]-(actor:Person)
-            4. Bad pattern: (p:Person)-[a:ACTED_IN]->(m:Movie)<-[a:DIRECTED]-(a:Person)  // Never do this!
-
-            QUERY EXAMPLES:
-            
-            1. For finding most common genres among high-grossing movies:
+            1. "Find all action movies with ratings above 8.0"
             {{
                 "pipeline": [
                     {{
@@ -146,30 +166,21 @@ class QueryParser:
                         "database": "postgresql",
                         "query": {{
                             "postgresql": "
-                                WITH high_grossing AS (
-                                    SELECT id 
-                                    FROM movies 
-                                    WHERE gross > 100000000
-                                ),
-                                genre_counts AS (
-                                    SELECT g.name, COUNT(*) as count
-                                    FROM genres g
-                                    JOIN movie_genres mg ON g.id = mg.genre_id
-                                    JOIN high_grossing hg ON mg.movie_id = hg.id
-                                    GROUP BY g.name
-                                    ORDER BY count DESC
-                                )
-                                SELECT name, count 
-                                FROM genre_counts"
+                                SELECT DISTINCT m.id, m.title, m.imdb_rating, m.release_year 
+                                FROM movies m
+                                JOIN movie_genres mg ON m.id = mg.movie_id
+                                JOIN genres g ON g.id = mg.genre_id
+                                WHERE g.name = 'Action'
+                                AND m.imdb_rating > 8.0
+                                ORDER BY m.imdb_rating DESC"
                         }},
-                        "output_keys": ["name", "count"],
-                        "description": "Get genre counts for high-grossing movies using CTEs"
+                        "output_keys": ["id", "title", "imdb_rating", "release_year"],
+                        "description": "Get high-rated action movies"
                     }}
-                ],
-                "final_merge_keys": ["name"]
+                ]
             }}
-            
-            2. For finding movies by director with ratings:
+
+            2. "Find directors who have worked with both Tom Hanks and Leonardo DiCaprio"
             {{
                 "pipeline": [
                     {{
@@ -177,39 +188,53 @@ class QueryParser:
                         "database": "neo4j",
                         "query": {{
                             "neo4j": "
-                                MATCH (p:Person)-[r:DIRECTED]->(m:Movie)
-                                WHERE p.name = 'Christopher Nolan'
+                                MATCH (actor1:Person {{name: 'Tom Hanks'}})-[r1:ACTED_IN]->(m1:Movie)<-[d1:DIRECTED]-(director:Person),
+                                    (actor2:Person {{name: 'Leonardo DiCaprio'}})-[r2:ACTED_IN]->(m2:Movie)<-[d2:DIRECTED]-(director)
+                                RETURN DISTINCT director.name as director_name"
+                        }},
+                        "output_keys": ["director_name"],
+                        "description": "Find directors who worked with both actors"
+                    }}
+                ]
+            }}
+
+            3. "Find high-grossing movies directed by Christopher Nolan"
+            {{
+                "pipeline": [
+                    {{
+                        "stage": 1,
+                        "database": "neo4j",
+                        "query": {{
+                            "neo4j": "
+                                MATCH (p:Person {{name: 'Christopher Nolan'}})-[r:DIRECTED]->(m:Movie)
                                 RETURN m.id as id"
                         }},
                         "output_keys": ["id"],
-                        "description": "Get movies by director"
+                        "description": "Get movies directed by Christopher Nolan"
                     }},
                     {{
                         "stage": 2,
                         "database": "postgresql",
                         "query": {{
                             "postgresql": "
-                                SELECT m.title, m.imdb_rating, m.release_year
+                                SELECT m.id, m.title, m.release_year, m.gross
                                 FROM movies m
-                                WHERE m.id IN ({{previous_stage1.id}})
-                                ORDER BY m.imdb_rating DESC"
+                                WHERE m.id IN {{previous_stage1.id}}
+                                AND m.gross > 100000000
+                                ORDER BY m.gross DESC"
                         }},
-                        "output_keys": ["title", "imdb_rating", "release_year"],
-                        "description": "Get movie details with ratings"
+                        "output_keys": ["id", "title", "release_year", "gross"],
+                        "description": "Get high-grossing movies from the director"
                     }}
-                ],
-                "final_merge_keys": ["id"]
+                ]
             }}
 
-            Return ONLY a JSON object with the exact structure shown in the examples.
-
-            Notes:
-            - Each stage can use results from previous stages using placeholder {{previous_stageN.key}} where N is the stage number (e.g. {{previous_stage1.id}})
-            - The output_keys specify which fields to pass to the next stage
-            - The output_keys specify which fields to pass to the next stage
-            - Include a description for each stage explaining its purpose
-            - Consider using Neo4j for relationship-heavy queries (directors, actors)
-            - Use PostgreSQL for numerical/text filtering and sorting (ratings, gross, years)
+            Return ONLY a JSON object containing a pipeline array of stages. Each stage must have:
+            - stage: number indicating order
+            - database: which database to query ("postgresql" or "neo4j")
+            - query: object with database-specific query
+            - output_keys: array of column names to pass to next stage
+            - description: string explaining what the stage does
             """
             
             response = await self.client.chat.completions.create(
@@ -219,21 +244,14 @@ class QueryParser:
                 max_tokens=2000
             )
             
-            # return json.loads(response.choices[0].message.content)
-
             content = response.choices[0].message.content.strip()
 
             # Clean up the content before parsing JSON
             content = content.replace('\n', ' ')  # Replace newlines with spaces
             content = ' '.join(content.split())   # Normalize whitespace
-            
-            # Remove any special characters that might interfere with JSON parsing
             content = content.replace('\t', ' ')  # Replace tabs
-            
-            # If the SQL queries contain newlines in the response, escape them properly
             content = content.replace('": "', '": "')  # Ensure consistent quote formatting
         
-            # Add error handling and logging for the JSON parsing
             try:
                 return json.loads(content)
             except json.JSONDecodeError as json_err:
@@ -271,49 +289,6 @@ class DatabaseConnector:
                   self.config.neo4j_config['password'])
         )
 
-class QueryGenerator:
-    """Generates database-specific queries"""
-    def generate_postgres_query(self, query_components: Dict) -> str:
-        """Generate PostgreSQL query from components"""
-        tables = query_components['tables']
-        conditions = query_components['conditions']
-        joins = query_components['joins']
-        
-        # Build query using components
-        query = f"SELECT * FROM {', '.join(tables)}"
-        if joins:
-            query += f" {' '.join(joins)}"
-        if conditions:
-            query += f" WHERE {' AND '.join(conditions)}"
-        
-        return query
-    
-    def generate_mongo_query(self, query_components: Dict) -> Dict:
-        """Generate MongoDB query from components"""
-        return {
-            'collection': query_components['collections'][0],
-            'filter': {cond['field']: cond['value'] 
-                      for cond in query_components['conditions']}
-        }
-    
-    def generate_neo4j_query(self, query_components: Dict) -> str:
-        """Generate Neo4j Cypher query from components"""
-        nodes = query_components['nodes']
-        relationships = query_components['relationships']
-        conditions = query_components['conditions']
-        
-        # Build Cypher query
-        query = f"MATCH "
-        # Add node patterns
-        node_patterns = [f"({node})" for node in nodes]
-        query += "-".join(node_patterns)
-        
-        if conditions:
-            query += f" WHERE {' AND '.join(conditions)}"
-        query += " RETURN " + ", ".join(nodes)
-        
-        return query
-
 class QueryExecutor:
     """Executes queries across different databases"""
     def __init__(self, connector: DatabaseConnector):
@@ -331,6 +306,9 @@ class QueryExecutor:
     #     return results
     def execute_postgres_query(self, query: str) -> List[Dict]:
         """Execute PostgreSQL query"""
+        if "IN ()" in query or "IN ( )" in query:
+            return []
+        
         with self.connector.get_postgres_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query)
@@ -406,16 +384,6 @@ class DataMerger:
                 merged.append(merged_item)
         
         return merged
-    
-    # def _merge_two_datasets(self, data1: List[Dict], data2: List[Dict], 
-    #                        merge_keys: List[str]) -> List[Dict]:
-    #     """Merge two datasets based on common keys"""
-    #     merged = []
-    #     for item1 in data1:
-    #         for item2 in data2:
-    #             if all(item1.get(key) == item2.get(key) for key in merge_keys):
-    #                 merged.append({**item1, **item2})
-    #     return merged
 
 class CacheManager:
     """Manages query caching using Redis"""
@@ -446,10 +414,37 @@ class NLMDQA:
         self.config = DatabaseConfig()
         self.parser = QueryParser(self.config)
         self.connector = DatabaseConnector(self.config)
-        self.query_generator = QueryGenerator()
         self.executor = QueryExecutor(self.connector)
         self.merger = DataMerger()
         self.cache_manager = CacheManager(self.connector.redis_client)
+    
+    def format_value_for_query(self, value, database_type):
+        """Format values appropriately for different database types"""
+        if isinstance(value, list):
+            if database_type == "neo4j":
+                # For Neo4j, wrap list in square brackets
+                formatted_values = []
+                for v in value:
+                    if isinstance(v, (int, float, decimal.Decimal)):
+                        formatted_values.append(str(v))
+                    else:
+                        formatted_values.append(f"'{v}'")
+                
+                # print(f"Formatted values: {formatted_values}")
+                return f"{', '.join(formatted_values)}"
+            else:  # postgresql or others
+                # For SQL, just join with commas
+                formatted_values = []
+                for v in value:
+                    if isinstance(v, (int, float, decimal.Decimal)):
+                        formatted_values.append(str(v))
+                    else:
+                        formatted_values.append(f"'{v}'")
+                return ', '.join(formatted_values)
+        else:
+            if isinstance(value, (int, float, decimal.Decimal)):
+                return str(value)
+            return f"'{value}'"
     
     async def process_query(self, natural_language_query: str) -> Dict:
         """Process natural language query and return results"""
@@ -479,34 +474,16 @@ class NLMDQA:
             if isinstance(query, str):
                 for prev_stage, prev_results in stage_results.items():
                     for key, value in prev_results.items():
-                        # Format list values for SQL IN clauses
-                        if isinstance(value, list):
-                            formatted_values = []
-                            for v in value:
-                                if isinstance(v, (int, float)):
-                                    formatted_values.append(str(v))
-                                else:
-                                    formatted_values.append(f"'{v}'")
-                            formatted_list = ', '.join(formatted_values)
-                            query = query.replace(f"{{previous_stage{prev_stage}.{key}}}", formatted_list)
-                        else:
-                            query = query.replace(f"{{previous_stage{prev_stage}.{key}}}", str(value))
+                        formatted_value = self.format_value_for_query(value, database)
+                        placeholder = f"{{previous_stage{prev_stage}.{key}}}"
+                        query = query.replace(placeholder, formatted_value)
             elif isinstance(query, dict):  # MongoDB query
                 query_str = json.dumps(query)
                 for prev_stage, prev_results in stage_results.items():
                     for key, value in prev_results.items():
-                        # Format list values for SQL IN clauses
-                        if isinstance(value, list):
-                            formatted_values = []
-                            for v in value:
-                                if isinstance(v, (int, float)):
-                                    formatted_values.append(str(v))
-                                else:
-                                    formatted_values.append(f"'{v}'")
-                            formatted_list = ', '.join(formatted_values)
-                            query_str = query_str.replace(f"{{previous_stage{prev_stage}.{key}}}", formatted_list)
-                        else:
-                            query_str = query_str.replace(f"{{previous_stage{prev_stage}.{key}}}", str(value))
+                        formatted_value = self.format_value_for_query(value, database)
+                        placeholder = f"{{previous_stage{prev_stage}.{key}}}"
+                        query = query.replace(placeholder, formatted_value)
                 query = json.loads(query_str)
 
             print(f"Stage {stage_num} formatted query: {query}")
@@ -525,14 +502,6 @@ class NLMDQA:
             }
             final_results[f"stage_{stage_num}"] = results
             test_final_results = results
-
-            # print(f"Stage {stage_num} results: {results}")
-        
-        # Merge results from all stages
-        # merged_results = self.merger.merge_results(
-        #     final_results,
-        #     pipeline_result['final_merge_keys']
-        # )
         
         # Cache results
         # self.cache_manager.cache_result(natural_language_query, merged_results)
@@ -545,7 +514,7 @@ async def main():
     nlmdqa = NLMDQA()
     
     # Example query
-    query = "Who are the directors that have made the most movies with Robert De Niro?"
+    query = "List movies where the director has also acted in another director's film"
     
     try:
         results = await nlmdqa.process_query(query)
