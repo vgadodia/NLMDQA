@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import decimal
 from json import JSONEncoder
+from time import time
 
 # Set up logging
 logging.basicConfig(
@@ -391,7 +392,6 @@ class CacheManager:
         self.cache = {}
         self.cache_ttl = 3600  # 1 hour
         self.timestamps = {}  # Store timestamps for TTL checking
-        from time import time
         self.time = time
     
     def get_cached_result(self, query: str) -> Union[List[Dict], None]:
@@ -426,6 +426,29 @@ class NLMDQA:
         self.merger = DataMerger()
         self.cache_manager = CacheManager()
     
+    async def generate_human_response(self, query: str, results: List[Dict]) -> str:
+        """Generate a human-readable response using GPT"""
+        try:
+            response = await self.parser.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains database query results in natural language."},
+                    {"role": "user", "content": f"""
+                        Original question: {query}
+                        
+                        Query results: {json.dumps(results, cls=CustomJSONEncoder)}
+                        
+                        Please provide a clear, concise summary of these results in natural language. 
+                        Format the response in a reader-friendly way."""}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Error generating human response: {str(e)}")
+            return "Sorry, I couldn't generate a human-readable response for these results."
+    
     def format_value_for_query(self, value, database_type):
         """Format values appropriately for different database types"""
         if isinstance(value, list):
@@ -439,7 +462,7 @@ class NLMDQA:
                         formatted_values.append(f"'{v}'")
                 
                 # print(f"Formatted values: {formatted_values}")
-                return f"{', '.join(formatted_values)}"
+                return f"[{', '.join(formatted_values)}]"
             else:  # postgresql or others
                 # For SQL, just join with commas
                 formatted_values = []
@@ -454,7 +477,7 @@ class NLMDQA:
                 return str(value)
             return f"'{value}'"
     
-    async def process_query(self, natural_language_query: str) -> Dict:
+    async def process_query(self, natural_language_query: str, human_readable: bool = False) -> Union[Dict, str]:
         """Process natural language query and return results"""
         # Check cache first
         cached_result = self.cache_manager.get_cached_result(natural_language_query)
@@ -513,20 +536,42 @@ class NLMDQA:
         
         # Cache results
         self.cache_manager.cache_result(natural_language_query, test_final_results)
-        
+
+        if human_readable:
+            return await self.generate_human_response(natural_language_query, test_final_results)
         return test_final_results
 
 # Example usage
 async def main():
+    import argparse
+
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Natural Language Multi-Database Query Agent')
+    parser.add_argument('--human-readable', '-hr', action='store_true', 
+                       help='Generate a human-readable response instead of raw data')
+    args = parser.parse_args()
+
     # Initialize the NLMDQA system
     nlmdqa = NLMDQA()
     
     # Example query
-    query = "Show me all movies with an IMDB rating above 8.5"
+    query = "Show me directors who have worked with the same actor in more than 3 movies"
     
     try:
-        results = await nlmdqa.process_query(query)
-        print(json.dumps(results, indent=2))
+        start_time = time()
+        results = await nlmdqa.process_query(query, human_readable=args.human_readable)
+
+        # Calculate elapsed time
+        elapsed_time = time() - start_time
+
+        if args.human_readable:
+            print("\nHuman-readable response:")
+            print(results)
+        else:
+            print("\nRaw query results:")
+            print(json.dumps(results, indent=2, cls=CustomJSONEncoder))
+
+        print(f"\nQuery processing time: {elapsed_time:.2f} seconds")
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")
 
