@@ -586,8 +586,10 @@ async def main():
     # Initialize the NLMDQA system
     nlmdqa = NLMDQA()
     
-    # Example query
-    query = "Find all war movies directed by Steven Spielberg that grossed over $200 million"
+    # Demo queries
+    # query = "Show me all movies with an IMDB rating above 8.5" # Postgres
+    # query = "Find all movies where Tom Hanks and Leonardo DiCaprio acted together" # Neo4j
+    query = "Find all war movies directed by Steven Spielberg that grossed over $200 million" # Multi-Database
     
     try:
         start_time = time()
